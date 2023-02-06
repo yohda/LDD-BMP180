@@ -70,6 +70,11 @@
 	pinctrl-0 = <&i2c1_gpio2>;
 	status = "okay";
 	clock-frequency = <100000>;
+
+    bcm180: bcm180@77 {
+        compatible = "robert-bosch,bmp180";
+        reg = <0x77>;
+    };  
 };
 
 &usb {
