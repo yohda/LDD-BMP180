@@ -6,6 +6,10 @@
 /* mdelay() */
 #include <linux/delay.h>
 
+/* hwmon */
+#include <linux/hwmon.h>
+#include <linux/hwmon-sysfs.h>
+
 #define BMP180_CHIP_ID_REG_ADDR 			(0xD0)
 	#define BMP180_CHIP_ID					(0x55)
 
@@ -27,8 +31,17 @@
 #define BMP180_CALI_FIRST_REG				(0xAA)
 #define BMP180_CALI_LAST_REG				(0xBF)
 
+#define BMP180_TEMP_DELAY 		(10) /* ms */
+#define BMP180_TEMP_COUNT 		(10)
+#define BMP180_TEMP_MEAS_WAIT	(50) /* ms */
+#define BMP180_TEMP_
 
 #define BMP180_NAME "BMP180"
+
+struct bmp180_chip {
+	struct i2c_client *client;
+	struct device *hwmon_dev;
+};
 
 enum {
 	AC1 = 0,
@@ -94,17 +107,11 @@ static int bmp180_get_cali(const struct i2c_client *client)
 	{
 		ret = bmp180_i2c_read(client, i, &msb);
 		if(ret)
-		{	
-			pr_err("[F:%d][L:%d] Failed to get cali. reg:0x%x, err:%d\n", __func__, __LINE__, i, ret);
 			return -EIO;
-		}
 		
 		ret = bmp180_i2c_read(client, i+1, &lsb);
 		if(ret)
-		{	
-			pr_err("[F:%d][L:%d] Failed to get cali. reg:0x%x, err:%d\n", __func__, __LINE__, i+1, ret);
 			return -EIO;
-		}
 
 		calis[(i-BMP180_CALI_FIRST_REG)/2] = 0xFF & msb;
 		calis[(i-BMP180_CALI_FIRST_REG)/2] = calis[(i-BMP180_CALI_FIRST_REG)/2] << 8;
@@ -123,57 +130,43 @@ static u16 bmp180_util_calc_temperature(const u16 ut)
 	b5 = x1 + x2;
 	t = (b5+8)/(1<<4);
 	
-	pr_info("t:%ld\n", t);	
-	
-	return 0;
+	return (u16)t;
 }
 
-static int bmp180_get_temperature(const struct i2c_client *client)
+static int bmp180_temperature_show(struct device *dev, struct device_attribute *devattr, char *buf)
 {
+	struct bmp180_chip *bmp180 = dev_get_drvdata(dev);
+	struct i2c_client *client = bmp180->client; 
 	int ret = 0, i = 0;
-	u8 ctrl = 0;
-	u16 ut = 0;
-
-	ret = bmp180_i2c_read(client, BMP180_CTRL_REG_ADDR, &ctrl);
-	if(ret < 0)
-		return -EIO;
+	u8 ctrl = 0, pre_ctrl_status = 0;
+	u16 ut = 0, temp = 0;
 	
-	ctrl = (u8)(ret & 0xFF);
-	ctrl |= BMP180_CTRL_MEAS_TEMP;
-	pr_info("ctrl:0x%x\n", ctrl);
-	
-	ret = bmp180_i2c_write(client, BMP180_CTRL_REG_ADDR, ctrl);
-	if(ret)
+	while(i++ < BMP180_TEMP_COUNT)
 	{
-		pr_err("[F:%d][L:%d] Failed to get temperature. err:%d\n", __func__, __LINE__, ret);
-		return ret;
-	}
+		ret = bmp180_i2c_read(client, BMP180_CTRL_REG_ADDR, &ctrl);
+		if(ret < 0)
+			return -EIO;
 
-	while(i < 10)
-	{
 		ctrl = (u8)(ret & 0xFF);
 		ctrl |= BMP180_CTRL_MEAS_TEMP;
 		ut = 0;
 		
 		ret = bmp180_i2c_write(client, BMP180_CTRL_REG_ADDR, ctrl);
 		if(ret)
-		{
-			pr_err("[F:%d][L:%d] Failed to get temperature. err:%d\n", __func__, __LINE__, ret);
 			return ret;
-		}
+
+		mdelay(BMP180_TEMP_MEAS_WAIT);
 
 		bmp180_i2c_read(client, BMP180_OUT_MSB_REG_ADDR, (u8 *)&ut);
 		ut = (ut << 8);
 		bmp180_i2c_read(client, BMP180_OUT_LSB_REG_ADDR, (u8 *)&ut);
 		
-		pr_info("ut:%d\n", ut);
+		temp += bmp180_util_calc_temperature(ut);
 	
-		bmp180_util_calc_temperature(ut);
-		
-		i++;
+		msleep(BMP180_TEMP_DELAY);	
 	}	
 
-	return 0;
+	return sprintf(buf, "%d", temp/BMP180_TEMP_COUNT);
 }
 
 static int bmp180_reset(const struct i2c_client *client)
@@ -208,18 +201,31 @@ static int bmp180_check_communication(const struct i2c_client *client)
 	return ret;
 }
 
+static SENSOR_DEVICE_ATTR_RO(temp, bmp180_temperature, 0);
+static struct attribute *bmp180_attrs[] = {
+	&sensor_dev_attr_temp.dev_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(bmp180);
+
 static int bmp180_probe(struct i2c_client *client,
                          const struct i2c_device_id *id)
 {
+	struct bmp180_chip *bmp180;
+	struct device *hwmon_dev;
     int err = 0;
-	pr_info("BMP180 Probe Started!!!\n");
 
 	if(!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE_DATA))
 	{
 		pr_err("No support i2c smbus");	
 		return -EIO;
 	}
-	
+
+	bmp180 = devm_kzalloc(&client->dev, sizeof(*bmp180), GFP_KERNEL);
+	if(!bmp180)
+		return -ENOMEM; 
+
+	bmp180->client = client;	
 	err = bmp180_check_communication(client);
 	if(err)
 		return err;
@@ -228,16 +234,9 @@ static int bmp180_probe(struct i2c_client *client,
 	if(err)
 		return err;
 
-	bmp180_get_temperature(client);
-	
-	pr_info("BMP180 Probe Done!!!\n");   	
-	return 0;
-}
+	hwmon_dev = devm_hwmon_device_register_with_groups(&client->dev,															client->name, bmp180, bmp180_groups);
 
-static int bmp180_remove(struct i2c_client *client)
-{   
-    pr_info("YOHDA BMP180 Removed!!!\n");
-    return 0;
+	return PTR_ERR_OR_ZERO(hwmon_dev);
 }
 
 static const struct of_device_id bmp180_dts[] = {
@@ -253,7 +252,6 @@ static struct i2c_driver bmp180_driver = {
 			.of_match_table = bmp180_dts,
         },
         .probe          = bmp180_probe,
-        .remove         = bmp180_remove,
 };
 
 module_i2c_driver(bmp180_driver);
@@ -261,3 +259,4 @@ module_i2c_driver(bmp180_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Yohan Yoon <dbsdy1235@gmail.com>");
 MODULE_DESCRIPTION("BMP180 Device Driver");
+
