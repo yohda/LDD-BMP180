@@ -10,6 +10,9 @@
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 
+/* regmap */
+#include <linux/regmap.h>
+
 #define BMP180_CHIP_ID_REG_ADDR 			(0xD0)
 	#define BMP180_CHIP_ID					(0x55)
 
@@ -31,16 +34,15 @@
 #define BMP180_CALI_FIRST_REG				(0xAA)
 #define BMP180_CALI_LAST_REG				(0xBF)
 
-#define BMP180_TEMP_DELAY 		(10) /* ms */
 #define BMP180_TEMP_COUNT 		(10)
 #define BMP180_TEMP_MEAS_WAIT	(50) /* ms */
-#define BMP180_TEMP_
 
 #define BMP180_NAME "BMP180"
 
 struct bmp180_chip {
 	struct i2c_client *client;
 	struct device *hwmon_dev;
+	struct regmap *regmap; 
 };
 
 enum {
@@ -60,56 +62,18 @@ enum {
 
 static short calis[CALI_MAX];
 
-static int bmp180_i2c_write(const struct i2c_client *client, const u8 reg, const u8 data)
-{
-	if(!client)
-	{
-		pr_err("i2c istances isn`t exist.\n");
-		return -EINVAL;
-	}
-
-	if(i2c_smbus_write_byte_data(client, reg, data) < 0)
-	{
-		pr_err("bmp180 i2c write error. reg:0x%x, data:0x%x\n", reg, data);
-		return -EIO;
-	}
-     
-    return 0;
-}
-
-static int bmp180_i2c_read(const struct i2c_client *client, const u8 reg, u8 *buf)
-{
-	int ret = 0;
-	if(!client)
-	{
-		pr_err("i2c istances isn`t exist.\n");
-		return -EINVAL;
-	}
-	
-	ret = i2c_smbus_read_byte_data(client, reg);
-	if(ret < 0)
-	{
-		pr_err("bmp180 i2c read error. reg:0x%x\n", reg);
-		return -EIO;
-	}
-
-	*buf = (u8)(ret & 0xFF);
-	 
-    return 0;
-}
-
-static int bmp180_get_cali(const struct i2c_client *client)
+static int bmp180_get_cali(const struct bmp180_chip *bmp180)
 {
 	int i, ret = 0;
-	u8 msb, lsb;
+	u32 msb, lsb;
 
 	for(i = BMP180_CALI_FIRST_REG, msb = 0, lsb = 0; i < BMP180_CALI_LAST_REG; i+=2)
 	{
-		ret = bmp180_i2c_read(client, i, &msb);
+		ret = regmap_read(bmp180->regmap, i, &msb);
 		if(ret)
 			return -EIO;
 		
-		ret = bmp180_i2c_read(client, i+1, &lsb);
+		ret = regmap_read(bmp180->regmap, i+1, &lsb);
 		if(ret)
 			return -EIO;
 
@@ -138,54 +102,53 @@ static int bmp180_temperature_show(struct device *dev, struct device_attribute *
 	struct bmp180_chip *bmp180 = dev_get_drvdata(dev);
 	struct i2c_client *client = bmp180->client; 
 	int ret = 0, i = 0;
-	u8 ctrl = 0, pre_ctrl_status = 0;
-	u16 ut = 0, temp = 0;
+	u32 ctrl = 0, temp = 0, tmp = 0;
+	u16 ut = 0;
 	
 	while(i++ < BMP180_TEMP_COUNT)
 	{
-		ret = bmp180_i2c_read(client, BMP180_CTRL_REG_ADDR, &ctrl);
+		ret = regmap_read(bmp180->regmap, BMP180_CTRL_REG_ADDR, &ctrl);
 		if(ret < 0)
 			return -EIO;
 
-		ctrl = (u8)(ret & 0xFF);
+		ctrl = 0xFF & ret;
 		ctrl |= BMP180_CTRL_MEAS_TEMP;
 		ut = 0;
-		
-		ret = bmp180_i2c_write(client, BMP180_CTRL_REG_ADDR, ctrl);
+	
+		ret = regmap_write(bmp180->regmap, BMP180_CTRL_REG_ADDR, ctrl);
 		if(ret)
 			return ret;
 
 		mdelay(BMP180_TEMP_MEAS_WAIT);
 
-		bmp180_i2c_read(client, BMP180_OUT_MSB_REG_ADDR, (u8 *)&ut);
-		ut = (ut << 8);
-		bmp180_i2c_read(client, BMP180_OUT_LSB_REG_ADDR, (u8 *)&ut);
-		
+		regmap_read(bmp180->regmap, BMP180_OUT_MSB_REG_ADDR, &tmp);
+		ut = 0xFF00 & (tmp << 8);
+		regmap_read(bmp180->regmap, BMP180_OUT_LSB_REG_ADDR, &tmp);
+		ut |= 0x00FF & tmp;
+
 		temp += bmp180_util_calc_temperature(ut);
-	
-		msleep(BMP180_TEMP_DELAY);	
 	}	
 
 	return sprintf(buf, "%d", temp/BMP180_TEMP_COUNT);
 }
 
-static int bmp180_reset(const struct i2c_client *client)
+static int bmp180_reset(const struct bmp180_chip *bmp180)
 {
 	int ret = 0;	
 	
-	ret = bmp180_i2c_write(client, BMP180_SOFT_REG_ADDR, BMP180_SOFT_RESET);
+	ret = regmap_write(bmp180->regmap, BMP180_SOFT_REG_ADDR, BMP180_SOFT_RESET);	
 	if(ret != 0)
 		return ret;
 
 	return 0;
 }
 
-static int bmp180_check_communication(const struct i2c_client *client)
+static int bmp180_check_communication(const struct bmp180_chip *bmp180)
 {
 	int ret = 0;
-	u8 id = 0;
-
-	ret = bmp180_i2c_read(client, BMP180_CHIP_ID_REG_ADDR, &id);
+	u32 id = 0;
+		
+	ret = regmap_read(bmp180->regmap, BMP180_CHIP_ID_REG_ADDR, &id);
 	if(ret < 0)
 	{
 		pr_err("Failed to communicate with bmp180 via i2c\n");
@@ -208,6 +171,11 @@ static struct attribute *bmp180_attrs[] = {
 };
 ATTRIBUTE_GROUPS(bmp180);
 
+static const struct regmap_config bmp180_regmap_config = {
+	.reg_bits = 8,
+	.val_bits = 8,
+};
+
 static int bmp180_probe(struct i2c_client *client,
                          const struct i2c_device_id *id)
 {
@@ -226,11 +194,15 @@ static int bmp180_probe(struct i2c_client *client,
 		return -ENOMEM; 
 
 	bmp180->client = client;	
-	err = bmp180_check_communication(client);
+	bmp180->regmap = devm_regmap_init_i2c(client, &bmp180_regmap_config);
+	if (IS_ERR(bmp180->regmap)) 
+		return PTR_ERR(bmp180->regmap);
+
+	err = bmp180_check_communication(bmp180);
 	if(err)
 		return err;
 
-	err = bmp180_get_cali(client);
+	err = bmp180_get_cali(bmp180);
 	if(err)
 		return err;
 
@@ -259,4 +231,3 @@ module_i2c_driver(bmp180_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Yohan Yoon <dbsdy1235@gmail.com>");
 MODULE_DESCRIPTION("BMP180 Device Driver");
-
